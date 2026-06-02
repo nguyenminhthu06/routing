@@ -1,21 +1,26 @@
+# Distance Vector Routing — Bellman-Ford + Poison Reverse
+# Mỗi router chỉ biết cost đến neighbor trực tiếp và DV neighbor gửi sang.
+# Công thức: dist(self→dst) = min over n [ cost(self→n) + dist(n→dst) ]
+# Poison Reverse: báo INFINITY ngược lại cho neighbor nếu đang route qua nó → giảm loop.
+# INFINITY = 16 (chuẩn RIP, dùng thay float('inf') vì json không serialize được).
+
 from router import Router
 from packet import Packet
 import json
 
-# Dùng 16 thay vì float('inf') vì float('inf') không serialize được sang JSON hợp lệ.
-# Project gợi ý dùng 16 cho count-to-infinity, đây cũng là giá trị an toàn để json.dumps/loads.
 INFINITY = 16
+
 
 class DVrouter(Router):
     def __init__(self, addr, heartbeat_time):
         Router.__init__(self, addr)
         self.heartbeat_time = heartbeat_time
         self.last_time = 0
-        self.my_dv = {self.addr: 0}
-        self.neighbor_dvs = {}  # {port: {dst: cost}}
-        self.port_to_addr = {}
-        self.link_costs = {}
-        self.forwarding_table = {}
+        self.my_dv = {self.addr: 0}  # DV của mình: {dst: best_cost}
+        self.neighbor_dvs = {}        # DV nhận từ neighbor: {port: {dst: cost}}
+        self.port_to_addr = {}        # {port: neighbor_addr}
+        self.link_costs = {}          # {port: cost}
+        self.forwarding_table = {}    # {dst: out_port}
 
     def handle_packet(self, port, packet):
         if packet.is_traceroute:
@@ -42,11 +47,11 @@ class DVrouter(Router):
             self.broadcast_dv()
 
     def update_dv(self):
+        """Tính lại DV theo Bellman-Ford. Trả về True nếu DV thay đổi."""
         old_dv = dict(self.my_dv)
         self.my_dv = {self.addr: 0}
         self.forwarding_table = {}
 
-        # Thu thập tất cả destination có thể biết được
         all_dsts = set()
         for dv in self.neighbor_dvs.values():
             all_dsts.update(dv.keys())
@@ -56,22 +61,18 @@ class DVrouter(Router):
         for dst in all_dsts:
             if dst == self.addr:
                 continue
-            best_cost = INFINITY
-            best_port = None
+            best_cost, best_port = INFINITY, None
 
             for port, cost_to_n in self.link_costs.items():
-                # Nếu dst chính là neighbor trực tiếp trên port này, khoảng cách từ neighbor = 0
-                # (clients không bao giờ gửi DV nên neighbor_dvs[port] sẽ rỗng với chúng)
+                # Nếu dst chính là neighbor trên port này thì cost từ n→dst = 0
                 if self.port_to_addr.get(port) == dst:
                     dist_from_n = 0
                 else:
                     dist_from_n = self.neighbor_dvs.get(port, {}).get(dst, INFINITY)
 
-                # Cộng cost link + cost từ neighbor, cap tại INFINITY để tránh tràn số
                 total = min(cost_to_n + dist_from_n, INFINITY)
                 if total < best_cost:
-                    best_cost = total
-                    best_port = port
+                    best_cost, best_port = total, port
 
             if best_port is not None and best_cost < INFINITY:
                 self.my_dv[dst] = best_cost
@@ -80,8 +81,8 @@ class DVrouter(Router):
         return old_dv != self.my_dv
 
     def broadcast_dv(self):
+        """Gửi DV đến tất cả neighbor, áp dụng Poison Reverse."""
         for port in self.links:
-            # Poison Reverse: quảng bá INFINITY đến neighbor nếu ta route qua chính neighbor đó
             poisoned_dv = {
                 dst: (cost if self.forwarding_table.get(dst) != port else INFINITY)
                 for dst, cost in self.my_dv.items()
